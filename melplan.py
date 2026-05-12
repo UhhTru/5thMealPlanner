@@ -1,820 +1,271 @@
-"""
-The Math Stack: Student Meal Planner AI
-========================================
-A Streamlit application using Mixed-Integer Linear Programming (MILP) via PuLP
-to optimize student nutrition on a budget.
-
-Math in AI Usage:
-  1. MILP (PuLP)         — Objective function maximizes protein, subject to budget + calorie constraints
-  2. Harris-Benedict BMR — Calculates personalized calorie targets from biometric inputs
-  3. Inventory Weighting — +100 bonus added to MILP objective coefficients for preferred ingredients
-  4. Shannon Entropy      — Measures meal-plan diversity (Science tab explainer)
-  5. Operations Research  — Full OR pipeline: model → solve → interpret (Science tab explainer)
-"""
-
 import streamlit as st
 import pandas as pd
-import numpy as np
-import math
+import requests
+import random
+import time
+from data import food_items_breakfast, food_items_lunch, food_items_dinner
+from prompts import pre_prompt_b, pre_prompt_l, pre_prompt_d, pre_breakfast, pre_lunch, pre_dinner, end_text, \
+    example_response_l, example_response_d, negative_prompt
 
-try:
-    import pulp
-except ModuleNotFoundError:
-    st.error(
-        "**PuLP not found.** Ensure `PuLP>=2.8.0` (capital P and L) is in your "
-        "`requirements.txt` and redeploy the app."
-    )
-    st.stop()
+UNITS_CM_TO_IN = 0.393701
+UNITS_KG_TO_LB = 2.20462
 
-# ─────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────
-st.set_page_config(
-    page_title="The Math Stack — Student Meal Planner AI",
-    page_icon="🧮",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ─────────────────────────────────────────────
-# CUSTOM CSS  (dark academic / retro-futuristic)
-# ─────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Serif+Display:ital@0;1&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
-
-:root {
-  --bg:        #0d0f14;
-  --surface:   #151821;
-  --border:    #252a38;
-  --accent:    #f5c518;
-  --accent2:   #3af0b0;
-  --muted:     #7a8099;
-  --text:      #e8eaf2;
-  --danger:    #ff5e5b;
-  --card-bg:   #1a1e2b;
+# Configure Groq API
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+HEADERS = {
+    "Authorization": f"Bearer {st.secrets['GROQ_API_KEY']}",
+    "Content-Type": "application/json"
 }
 
-html, body, [class*="css"] {
-  background-color: var(--bg) !important;
-  color: var(--text) !important;
-  font-family: 'IBM Plex Sans', sans-serif;
-}
+# Disable SSL verification warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-/* Headings */
-h1, h2, h3 { font-family: 'DM Serif Display', serif; letter-spacing: .02em; }
-h1 { font-size: 2.6rem; color: var(--accent); }
-h2 { font-size: 1.8rem; color: var(--accent2); }
-h3 { font-size: 1.2rem; color: var(--text); }
+st.set_page_config(page_title="AI - Meal Planner", page_icon="🍴")
 
-/* Sidebar */
-[data-testid="stSidebar"] {
-  background: var(--surface) !important;
-  border-right: 1px solid var(--border);
-}
-[data-testid="stSidebar"] label { font-family: 'Space Mono', monospace; font-size:.75rem; color: var(--muted); letter-spacing:.08em; text-transform:uppercase; }
+st.title("AI Meal Planner")
+st.divider()
 
-/* Metric cards */
-.metric-card {
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 1.1rem 1.4rem;
-  text-align: center;
-}
-.metric-label { font-family:'Space Mono',monospace; font-size:.68rem; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; }
-.metric-value { font-family:'DM Serif Display',serif; font-size:2rem; color:var(--accent); margin:.15rem 0; }
-.metric-sub   { font-size:.75rem; color:var(--muted); }
+st.write(
+    "This is a AI based meal planner that uses a persons information. The planner can be used to find a meal plan that satisfies the user's calorie and macronutrient requirements.")
+st.markdown("*Powered by Llama-3 70B*")
 
-/* Meal card */
-.meal-card {
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-  margin-bottom: 1rem;
-  transition: border-color .2s;
-}
-.meal-card:hover { border-color: var(--accent2); }
-.meal-img { width:100%; height:155px; object-fit:cover; }
-.meal-body { padding:.75rem 1rem; }
-.meal-name { font-family:'DM Serif Display',serif; font-size:1.05rem; color:var(--accent); margin:0 0 .3rem; }
-.meal-macro {
-  display:flex; gap:.5rem; flex-wrap:wrap;
-  font-family:'Space Mono',monospace; font-size:.65rem; color:var(--muted);
-  margin-bottom:.5rem;
-}
-.pill { background:var(--border); border-radius:20px; padding:.15rem .55rem; }
-.pill-green { background:#1a3028; color:var(--accent2); }
-.pill-gold  { background:#2e2610; color:var(--accent); }
-.pill-red   { background:#2e1515; color:var(--danger); }
+st.divider()
 
-/* Tabs */
-[data-baseweb="tab"] { font-family:'Space Mono',monospace; font-size:.8rem; color:var(--muted); }
-[aria-selected="true"] { color:var(--accent) !important; border-bottom:2px solid var(--accent) !important; }
+st.write("Enter your information:")
+name = st.text_input("Enter your name")
+age = st.number_input("Enter your age", step=1)
 
-/* Expander */
-[data-testid="stExpander"] {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
+unit_preference = st.radio("Preferred units:", ["Metric (kg, cm)", "Imperial (lb, ft + in)"])
 
-/* Buttons */
-.stButton > button {
-  background: var(--border);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-family:'Space Mono',monospace;
-  font-size:.72rem;
-  transition: background .15s, border-color .15s;
-}
-.stButton > button:hover {
-  background: #1f2535;
-  border-color: var(--accent2);
-  color: var(--accent2);
-}
+if unit_preference == "Metric (kg, cm)":
+    weight = st.number_input("Enter your weight (kg)")
+    height = st.number_input("Enter your height (cm)")
+else:
+    weight_lb = st.number_input("Enter your weight (lb)")
+    
+    # Use columns to align feet and inches inputs next to each other
+    col1, col2 = st.columns(2)
+    with col1:
+        height_ft = st.number_input("Enter your height (ft)")
+    with col2:
+        height_in = st.number_input("Enter your height (in)")
 
-/* Solve button */
-.solve-btn > button {
-  background: var(--accent) !important;
-  color: #0d0f14 !important;
-  font-weight: 700 !important;
-  border: none !important;
-  width: 100%;
-  padding: .6rem;
-  font-size: .9rem !important;
-  border-radius: 8px !important;
-}
+    # Convert imperial to metric
+    weight = weight_lb * UNITS_LB_TO_KG
+    height = (height_ft * 12 + height_in) * UNITS_IN_TO_CM
 
-/* Info box */
-.info-box {
-  background: #111827;
-  border-left: 3px solid var(--accent2);
-  padding: .8rem 1.1rem;
-  border-radius: 0 8px 8px 0;
-  font-size: .85rem;
-  margin: .8rem 0;
-}
-.math-tag {
-  display:inline-block;
-  background:#0f1e33;
-  border:1px solid #1a4a80;
-  color:#6db3f2;
-  font-family:'Space Mono',monospace;
-  font-size:.65rem;
-  padding:.1rem .45rem;
-  border-radius:4px;
-  margin:.15rem .1rem;
-}
-
-/* Divider */
-hr { border-color: var(--border); }
-</style>
-""", unsafe_allow_html=True)
+gender = st.radio("Choose your gender:", ["Male", "Female"])
+example_response = f"This is just an example but use your creativity: You can start with, Hello {name}! I'm thrilled to be your meal planner for the day, and I've crafted a delightful and flavorful meal plan just for you. But fear not, this isn't your ordinary, run-of-the-mill meal plan. It's a culinary adventure designed to keep your taste buds excited while considering the calories you can intake. So, get ready!"
 
 
-# ─────────────────────────────────────────────
-# DATA  — 200 student-friendly meals
-# ─────────────────────────────────────────────
-@st.cache_data
-def get_meal_data() -> pd.DataFrame:
-    meals = [
-        # ── BREAKFAST (IDs 0-69) ──────────────────────────────────────────────
-        ("Peanut Butter Oat Bowl",          380, 14, 5.5,  "oats, peanut butter, banana, milk, honey",
-         "1. Cook oats with milk for 5 min.\n2. Stir in peanut butter.\n3. Top with sliced banana and drizzle honey.",
-         "https://images.unsplash.com/photo-1516714819001-8ee7a13b71d7?w=400&q=70"),
-        ("Classic Scrambled Eggs",          310, 21, 4.0,  "eggs, butter, milk, salt, pepper",
-         "1. Whisk 3 eggs with 2 tbsp milk.\n2. Melt butter in pan on low heat.\n3. Add eggs and stir slowly until just set.",
-         "https://images.unsplash.com/photo-1510693206972-df098062cb71?w=400&q=70"),
-        ("Avocado Toast",                   350, 9,  7.0,  "bread, avocado, lemon, salt, chili flakes",
-         "1. Toast bread.\n2. Mash avocado with lemon juice.\n3. Spread, season with salt and chili flakes.",
-         "https://images.unsplash.com/photo-1541519227354-08fa5d50c820?w=400&q=70"),
-        ("Greek Yogurt Parfait",            290, 18, 6.5,  "greek yogurt, granola, berries, honey",
-         "1. Layer yogurt in a bowl.\n2. Add granola.\n3. Top with mixed berries and honey.",
-         "https://images.unsplash.com/photo-1488477181946-6428a0291777?w=400&q=70"),
-        ("Banana Protein Smoothie",         330, 22, 5.0,  "banana, protein powder, milk, peanut butter, ice",
-         "1. Add all ingredients to blender.\n2. Blend 45 seconds until smooth.\n3. Pour and serve immediately.",
-         "https://images.unsplash.com/photo-1553530979-7ee52a2670c4?w=400&q=70"),
-        ("Whole Wheat Pancakes",            410, 12, 5.5,  "whole wheat flour, eggs, milk, baking powder, honey",
-         "1. Mix flour, baking powder, egg, and milk.\n2. Cook on greased pan 2 min per side.\n3. Drizzle with honey.",
-         "https://images.unsplash.com/photo-1567620905732-2d1ec7ab7445?w=400&q=70"),
-        ("Egg & Cheese Sandwich",           430, 23, 5.0,  "eggs, cheese, bread, butter, tomato",
-         "1. Fry egg in butter.\n2. Layer egg and cheese on toast.\n3. Add tomato slices.",
-         "https://images.unsplash.com/photo-1550507992-eb63ffee0847?w=400&q=70"),
-        ("Overnight Chia Oats",             310, 11, 6.0,  "oats, chia seeds, milk, vanilla, mango",
-         "1. Mix oats, chia seeds, and milk.\n2. Refrigerate overnight.\n3. Top with mango chunks.",
-         "https://images.unsplash.com/photo-1495214783159-3503fd1b572d?w=400&q=70"),
-        ("Almond Butter Toast",             360, 10, 6.5,  "bread, almond butter, banana, cinnamon",
-         "1. Toast bread golden.\n2. Spread almond butter generously.\n3. Top with banana slices and cinnamon.",
-         "https://images.unsplash.com/photo-1542759564-7ccbb6ac450a?w=400&q=70"),
-        ("Veggie Omelette",                 290, 20, 5.5,  "eggs, bell pepper, onion, spinach, olive oil",
-         "1. Sauté pepper and onion 3 min.\n2. Add spinach, cook 1 min.\n3. Pour beaten eggs, fold when set.",
-         "https://images.unsplash.com/photo-1525351484163-7529414344d8?w=400&q=70"),
-        ("Cottage Cheese Bowl",             250, 24, 5.0,  "cottage cheese, pineapple, honey, walnuts",
-         "1. Scoop cottage cheese into bowl.\n2. Add pineapple pieces.\n3. Drizzle honey and scatter walnuts.",
-         "https://images.unsplash.com/photo-1559181567-c3190ca9be46?w=400&q=70"),
-        ("Fruit & Nut Granola Bowl",        370, 9,  6.0,  "granola, milk, apple, raisins, almonds",
-         "1. Pour granola into bowl.\n2. Add cold milk.\n3. Top with diced apple, raisins and almonds.",
-         "https://images.unsplash.com/photo-1517093157656-b9eccef91cb1?w=400&q=70"),
-        ("Shakshuka",                       360, 18, 6.5,  "eggs, tomatoes, onion, garlic, cumin, bell pepper",
-         "1. Sauté onion, garlic, pepper 5 min.\n2. Add tomatoes and cumin, simmer 8 min.\n3. Crack eggs into sauce, cover until whites set.",
-         "https://images.unsplash.com/photo-1590412200988-a436970781fa?w=400&q=70"),
-        ("Hummus & Veggie Wrap",            390, 13, 6.0,  "tortilla, hummus, cucumber, tomato, spinach, carrot",
-         "1. Spread hummus on tortilla.\n2. Layer veggies.\n3. Roll tightly and slice.",
-         "https://images.unsplash.com/photo-1565299585323-38d6b0865b47?w=400&q=70"),
-        ("Multigrain Cereal & Milk",        280, 8,  4.0,  "multigrain cereal, milk, strawberries",
-         "1. Pour cereal into bowl.\n2. Add cold milk.\n3. Top with sliced strawberries.",
-         "https://images.unsplash.com/photo-1521483451569-e33803c0330c?w=400&q=70"),
-        ("Feta Egg Scramble",               320, 22, 6.5,  "eggs, feta cheese, tomato, spinach, olive oil",
-         "1. Sauté spinach and tomato.\n2. Add beaten eggs.\n3. Crumble feta on top, scramble until set.",
-         "https://images.unsplash.com/photo-1595295333158-4742f28fbd85?w=400&q=70"),
-        ("Protein Waffle",                  400, 28, 7.0,  "protein powder, oats, egg, milk, vanilla",
-         "1. Blend all ingredients into smooth batter.\n2. Pour into waffle iron.\n3. Cook until golden, top with honey.",
-         "https://images.unsplash.com/photo-1551892374-ecf8754cf8b0?w=400&q=70"),
-        ("Date & Walnut Oatmeal",           360, 10, 5.5,  "oats, dates, walnuts, milk, cinnamon",
-         "1. Cook oats with milk.\n2. Stir in chopped dates.\n3. Top with walnuts and cinnamon.",
-         "https://images.unsplash.com/photo-1516714819001-8ee7a13b71d7?w=400&q=70"),
-        ("Smashed Egg on Rice",             350, 20, 4.5,  "rice, eggs, soy sauce, sesame oil, spring onion",
-         "1. Cook rice.\n2. Fry egg sunny-side up.\n3. Place on rice, add soy sauce and sesame oil.",
-         "https://images.unsplash.com/photo-1490645935967-10de6ba17061?w=400&q=70"),
-        ("Mango Lassi & Toast",             300, 8,  5.0,  "mango, yogurt, milk, cardamom, bread",
-         "1. Blend mango, yogurt, milk, cardamom.\n2. Toast bread.\n3. Serve lassi alongside toast.",
-         "https://images.unsplash.com/photo-1610478920693-49be16e8b5fa?w=400&q=70"),
-        # ── LUNCH (IDs 20-109) ───────────────────────────────────────────────
-        ("Chicken Rice Bowl",               550, 42, 9.0,  "chicken breast, rice, broccoli, soy sauce, garlic",
-         "1. Season and grill chicken 7 min per side.\n2. Cook rice.\n3. Steam broccoli, assemble with soy-garlic sauce.",
-         "https://images.unsplash.com/photo-1512058564366-18510be2db19?w=400&q=70"),
-        ("Lentil Soup",                     380, 20, 5.5,  "red lentils, onion, tomato, cumin, turmeric, garlic",
-         "1. Sauté onion, garlic.\n2. Add lentils, tomato, spices and water.\n3. Simmer 20 min and blend partially.",
-         "https://images.unsplash.com/photo-1547592166-23ac45744acd?w=400&q=70"),
-        ("Tuna Salad Wrap",                 430, 32, 7.0,  "canned tuna, tortilla, lettuce, tomato, mayo, lemon",
-         "1. Mix tuna with mayo and lemon.\n2. Layer on tortilla with lettuce and tomato.\n3. Roll firmly.",
-         "https://images.unsplash.com/photo-1540420773420-3366772f4999?w=400&q=70"),
-        ("Falafel Pita",                    480, 16, 7.5,  "falafel, pita, tahini, lettuce, tomato, cucumber",
-         "1. Warm falafel in pan.\n2. Open pita, spread tahini.\n3. Stuff with falafel and veggies.",
-         "https://images.unsplash.com/photo-1529006557810-274b9b2fc783?w=400&q=70"),
-        ("Pasta Primavera",                 520, 18, 8.0,  "pasta, zucchini, bell pepper, tomatoes, parmesan, olive oil",
-         "1. Boil pasta al dente.\n2. Sauté veggies in olive oil.\n3. Toss together with parmesan.",
-         "https://images.unsplash.com/photo-1551892374-ecf8754cf8b0?w=400&q=70"),
-        ("Black Bean Burrito",              570, 22, 7.5,  "black beans, tortilla, rice, salsa, cheese, sour cream",
-         "1. Heat black beans with cumin.\n2. Warm tortilla.\n3. Fill with rice, beans, salsa, cheese and sour cream.",
-         "https://images.unsplash.com/photo-1534352956036-cd81e27dd615?w=400&q=70"),
-        ("Quinoa Veggie Bowl",              430, 15, 8.5,  "quinoa, chickpeas, spinach, feta, lemon, olive oil",
-         "1. Cook quinoa.\n2. Roast chickpeas 20 min.\n3. Assemble with spinach, feta, lemon-olive oil dressing.",
-         "https://images.unsplash.com/photo-1512621776951-a57141f2eefd?w=400&q=70"),
-        ("Chicken Caesar Salad",            460, 38, 9.5,  "chicken breast, romaine, caesar dressing, croutons, parmesan",
-         "1. Grill and slice chicken.\n2. Toss romaine with dressing.\n3. Add croutons, parmesan, and chicken.",
-         "https://images.unsplash.com/photo-1546793665-c74683f339c1?w=400&q=70"),
-        ("Egg Fried Rice",                  490, 16, 5.5,  "rice, eggs, soy sauce, peas, carrot, garlic, sesame oil",
-         "1. Cook rice and cool.\n2. Scramble eggs, add veggies.\n3. Add rice, soy sauce, sesame oil.",
-         "https://images.unsplash.com/photo-1603133872878-684f208fb84b?w=400&q=70"),
-        ("Spicy Chickpea Curry",            440, 16, 6.0,  "chickpeas, tomatoes, onion, garam masala, turmeric, ginger",
-         "1. Sauté onion, ginger.\n2. Add spices, tomatoes and chickpeas.\n3. Simmer 15 min.",
-         "https://images.unsplash.com/photo-1455619452474-d2be8b1e70cd?w=400&q=70"),
-        ("Grilled Cheese Tomato Soup",      520, 14, 7.0,  "cheese, bread, butter, tomatoes, onion, basil",
-         "1. Make tomato soup: blend cooked tomatoes with basil.\n2. Butter bread, add cheese, grill both sides.",
-         "https://images.unsplash.com/photo-1547592166-23ac45744acd?w=400&q=70"),
-        ("Beef & Veggie Stir Fry",          580, 38, 11.0, "beef strips, broccoli, bell pepper, soy sauce, garlic, rice",
-         "1. Marinate beef in soy and garlic.\n2. Stir-fry beef then veggies on high heat.\n3. Serve over rice.",
-         "https://images.unsplash.com/photo-1512058564366-18510be2db19?w=400&q=70"),
-        ("Sweet Potato & Lentil Soup",      360, 14, 5.5,  "sweet potato, lentils, onion, cumin, coriander, coconut milk",
-         "1. Cook onion, add spices.\n2. Add sweet potato and lentils with water.\n3. Simmer 25 min, stir in coconut milk.",
-         "https://images.unsplash.com/photo-1547592166-23ac45744acd?w=400&q=70"),
-        ("Turkey Lettuce Wraps",            330, 30, 8.5,  "ground turkey, lettuce, hoisin sauce, garlic, ginger, onion",
-         "1. Brown turkey with garlic and ginger.\n2. Add hoisin sauce.\n3. Spoon into lettuce leaves.",
-         "https://images.unsplash.com/photo-1540420773420-3366772f4999?w=400&q=70"),
-        ("Caprese Pasta",                   490, 16, 8.0,  "pasta, mozzarella, tomato, basil, olive oil, balsamic",
-         "1. Cook pasta.\n2. Slice mozzarella and tomato.\n3. Toss all with olive oil and balsamic.",
-         "https://images.unsplash.com/photo-1551892374-ecf8754cf8b0?w=400&q=70"),
-        ("Noodle Veggie Broth",             310, 10, 5.0,  "noodles, vegetable broth, bok choy, mushroom, soy sauce, tofu",
-         "1. Heat broth.\n2. Add noodles and tofu, cook 5 min.\n3. Add bok choy and mushroom, simmer 3 min.",
-         "https://images.unsplash.com/photo-1569718212165-3a8278d5f624?w=400&q=70"),
-        ("Shrimp Tacos",                    480, 28, 12.0, "shrimp, corn tortillas, cabbage, lime, salsa, avocado",
-         "1. Season and grill shrimp.\n2. Warm tortillas.\n3. Assemble with cabbage, salsa and avocado.",
-         "https://images.unsplash.com/photo-1565299585323-38d6b0865b47?w=400&q=70"),
-        ("Masoor Dal with Rice",            430, 18, 5.0,  "red lentils, rice, cumin, turmeric, onion, tomato",
-         "1. Cook lentils with spices.\n2. Temper cumin in oil, pour over.\n3. Serve with steamed rice.",
-         "https://images.unsplash.com/photo-1601050690597-df0568f70950?w=400&q=70"),
-        ("BLT Sandwich",                    470, 20, 8.0,  "bread, bacon, lettuce, tomato, mayo",
-         "1. Grill bacon until crispy.\n2. Toast bread, spread mayo.\n3. Layer bacon, lettuce, tomato.",
-         "https://images.unsplash.com/photo-1550507992-eb63ffee0847?w=400&q=70"),
-        ("Cheese Quesadilla",               450, 18, 6.5,  "tortilla, cheese, salsa, sour cream, jalapeño",
-         "1. Grate cheese onto half the tortilla.\n2. Add jalapeño, fold over.\n3. Cook on pan until golden both sides.",
-         "https://images.unsplash.com/photo-1534352956036-cd81e27dd615?w=400&q=70"),
-        # ── DINNER (IDs 40-199) ──────────────────────────────────────────────
-        ("Grilled Salmon & Quinoa",         580, 46, 18.0, "salmon fillet, quinoa, lemon, dill, olive oil, asparagus",
-         "1. Season salmon, grill 4 min per side.\n2. Cook quinoa.\n3. Roast asparagus with olive oil, serve together.",
-         "https://images.unsplash.com/photo-1467003909585-2f8a72700288?w=400&q=70"),
-        ("Spaghetti Bolognese",             620, 34, 10.5, "spaghetti, ground beef, tomatoes, onion, garlic, basil",
-         "1. Brown beef with onion and garlic.\n2. Add tomatoes and basil, simmer 20 min.\n3. Serve over al-dente spaghetti.",
-         "https://images.unsplash.com/photo-1555949258-eb67b1ef0ceb?w=400&q=70"),
-        ("Butter Chicken with Naan",        650, 40, 13.0, "chicken, tomato, butter, cream, garam masala, garlic, naan",
-         "1. Marinate and grill chicken.\n2. Make sauce with butter, tomato, cream and spices.\n3. Add chicken, serve with warm naan.",
-         "https://images.unsplash.com/photo-1565557623262-b51c2513a641?w=400&q=70"),
-        ("Veggie Stir-Fry Noodles",         460, 14, 7.5,  "noodles, broccoli, carrot, bell pepper, soy sauce, sesame oil",
-         "1. Cook noodles, drain.\n2. Stir-fry veggies on high heat.\n3. Add noodles and sauce, toss well.",
-         "https://images.unsplash.com/photo-1569718212165-3a8278d5f624?w=400&q=70"),
-        ("Baked Chicken Thighs",            520, 42, 10.0, "chicken thighs, garlic, paprika, olive oil, lemon",
-         "1. Mix garlic, paprika, olive oil and lemon.\n2. Coat chicken, refrigerate 30 min.\n3. Bake at 200°C for 35 min.",
-         "https://images.unsplash.com/photo-1532550907401-a500c9a57435?w=400&q=70"),
-        ("Veggie Biryani",                  540, 14, 7.0,  "basmati rice, mixed vegetables, biryani spices, onion, yogurt",
-         "1. Fry onions until golden.\n2. Cook veggies with biryani spices.\n3. Layer with par-cooked rice, cook on dum 20 min.",
-         "https://images.unsplash.com/photo-1563379091339-03b21ab4a4f8?w=400&q=70"),
-        ("Stuffed Bell Peppers",            450, 28, 9.5,  "bell peppers, ground beef, rice, tomatoes, cheese, onion",
-         "1. Hollow peppers, pre-bake 10 min.\n2. Mix beef, rice, tomato, onion.\n3. Stuff peppers, top with cheese, bake 25 min.",
-         "https://images.unsplash.com/photo-1518779578993-ec3579fee39f?w=400&q=70"),
-        ("Tuna Pasta Bake",                 530, 32, 9.0,  "pasta, canned tuna, cheese, tomato sauce, mushrooms",
-         "1. Mix cooked pasta with tuna and tomato sauce.\n2. Add mushrooms, top with cheese.\n3. Bake at 190°C for 20 min.",
-         "https://images.unsplash.com/photo-1551892374-ecf8754cf8b0?w=400&q=70"),
-        ("Dahl & Roti",                     430, 17, 5.0,  "lentils, roti, onion, tomato, cumin, coriander",
-         "1. Cook lentils with spices.\n2. Temper mustard seeds and onion.\n3. Serve hot with warm roti.",
-         "https://images.unsplash.com/photo-1601050690597-df0568f70950?w=400&q=70"),
-        ("Prawn Fried Rice",                510, 28, 12.0, "prawns, rice, eggs, soy sauce, spring onion, garlic",
-         "1. Cook and cool rice.\n2. Stir-fry prawns with garlic.\n3. Add rice, eggs, soy sauce, toss on high heat.",
-         "https://images.unsplash.com/photo-1603133872878-684f208fb84b?w=400&q=70"),
-        ("Mushroom Risotto",                510, 14, 9.0,  "arborio rice, mushrooms, parmesan, white wine, onion, broth",
-         "1. Sauté onion and mushrooms.\n2. Add rice and wine, stir until absorbed.\n3. Add broth ladle by ladle, finish with parmesan.",
-         "https://images.unsplash.com/photo-1476124369491-e7addf5db371?w=400&q=70"),
-        # FILLER MEALS 51-199 (generated systematically for variety)
-        *[
-            (f"Spiced Chicken Bowl #{i}",   500+i%80, 35+i%10, 8.0+(i%6)*.5,
-             "chicken breast, rice, olive oil, garlic, lemon, cumin",
-             "1. Season chicken.\n2. Grill 7 min per side.\n3. Serve over rice with lemon.",
-             "https://images.unsplash.com/photo-1512058564366-18510be2db19?w=400&q=70")
-            for i in range(50, 65)
-        ],
-        *[
-            (f"Lentil & Veggie Curry #{i}", 400+i%70, 17+i%8,  5.5+(i%5)*.4,
-             "lentils, tomato, onion, turmeric, cumin, coriander, ginger",
-             "1. Sauté aromatics.\n2. Add lentils and tomato.\n3. Simmer 20 min with spices.",
-             "https://images.unsplash.com/photo-1455619452474-d2be8b1e70cd?w=400&q=70")
-            for i in range(65, 80)
-        ],
-        *[
-            (f"Egg & Rice Stir Fry #{i}",   420+i%60, 18+i%9,  4.5+(i%5)*.3,
-             "eggs, rice, soy sauce, garlic, sesame oil, peas",
-             "1. Scramble eggs.\n2. Add cold rice and peas.\n3. Season with soy sauce and sesame.",
-             "https://images.unsplash.com/photo-1603133872878-684f208fb84b?w=400&q=70")
-            for i in range(80, 95)
-        ],
-        *[
-            (f"Tuna Pasta #{i}",            490+i%50, 28+i%8,  7.5+(i%5)*.5,
-             "pasta, canned tuna, tomato sauce, cheese, garlic",
-             "1. Cook pasta.\n2. Mix tuna with tomato sauce.\n3. Combine and top with cheese.",
-             "https://images.unsplash.com/photo-1551892374-ecf8754cf8b0?w=400&q=70")
-            for i in range(95, 110)
-        ],
-        *[
-            (f"Veggie Noodle Bowl #{i}",    380+i%60, 12+i%7,  5.0+(i%5)*.3,
-             "noodles, bok choy, mushroom, soy sauce, ginger, sesame oil",
-             "1. Boil noodles.\n2. Stir fry veggies.\n3. Toss together with sauce.",
-             "https://images.unsplash.com/photo-1569718212165-3a8278d5f624?w=400&q=70")
-            for i in range(110, 125)
-        ],
-        *[
-            (f"Chickpea Salad #{i}",        350+i%50, 14+i%6,  5.0+(i%5)*.4,
-             "chickpeas, cucumber, tomato, olive oil, lemon, parsley",
-             "1. Drain and rinse chickpeas.\n2. Chop veggies.\n3. Toss with olive oil and lemon.",
-             "https://images.unsplash.com/photo-1512621776951-a57141f2eefd?w=400&q=70")
-            for i in range(125, 140)
-        ],
-        *[
-            (f"Beef Rice Bowl #{i}",        560+i%70, 38+i%10, 10.0+(i%6)*.5,
-             "beef strips, rice, soy sauce, garlic, broccoli",
-             "1. Stir-fry beef.\n2. Add broccoli and sauce.\n3. Serve over rice.",
-             "https://images.unsplash.com/photo-1512058564366-18510be2db19?w=400&q=70")
-            for i in range(140, 155)
-        ],
-        *[
-            (f"Greek Salad Wrap #{i}",      370+i%50, 12+i%6,  6.5+(i%5)*.3,
-             "tortilla, feta, cucumber, tomato, olives, lettuce",
-             "1. Chop salad ingredients.\n2. Mix with feta and olives.\n3. Wrap in tortilla.",
-             "https://images.unsplash.com/photo-1565299585323-38d6b0865b47?w=400&q=70")
-            for i in range(155, 170)
-        ],
-        *[
-            (f"Salmon & Rice #{i}",         570+i%60, 42+i%8,  16.0+(i%6)*1.0,
-             "salmon fillet, rice, soy sauce, lemon, ginger",
-             "1. Pan-fry salmon 4 min per side.\n2. Cook rice.\n3. Serve with soy-ginger sauce.",
-             "https://images.unsplash.com/photo-1467003909585-2f8a72700288?w=400&q=70")
-            for i in range(170, 185)
-        ],
-        *[
-            (f"Cottage Cheese Oat Bowl #{i}", 310+i%40, 22+i%8, 5.0+(i%5)*.3,
-             "cottage cheese, oats, honey, banana, cinnamon",
-             "1. Cook oats.\n2. Stir in cottage cheese.\n3. Top with banana, honey and cinnamon.",
-             "https://images.unsplash.com/photo-1516714819001-8ee7a13b71d7?w=400&q=70")
-            for i in range(185, 200)
-        ],
-    ]
-    # Trim/pad to exactly 200
-    meals = meals[:200]
-    cols = ["Name", "Calories", "Protein", "Cost", "Ingredients", "Recipe", "Image"]
-    return pd.DataFrame(meals, columns=cols)
-
-
-# ─────────────────────────────────────────────
-# HARRIS-BENEDICT BMR  ← Math in AI #1
-# ─────────────────────────────────────────────
-def calc_target_calories(age: int, gender: str, weight_kg: float,
-                          height_cm: float, activity: str) -> float:
-    """
-    Math in AI — Harris-Benedict Revised Equation for BMR,
-    multiplied by TDEE activity factor.
-    """
+def calculate_bmr(weight, height, age, gender):
     if gender == "Male":
-        bmr = 88.362 + 13.397 * weight_kg + 4.799 * height_cm - 5.677 * age
+        bmr = 9.99 * weight + 6.25 * height - 4.92 * age + 5
     else:
-        bmr = 447.593 + 9.247 * weight_kg + 3.098 * height_cm - 4.330 * age
+        bmr = 9.99 * weight + 6.25 * height - 4.92 * age - 161
 
-    factors = {
-        "Sedentary (little/no exercise)":  1.2,
-        "Lightly active (1-3 days/week)":  1.375,
-        "Moderately active (3-5 days/wk)": 1.55,
-        "Very active (6-7 days/wk)":       1.725,
-        "Athlete (2x/day training)":       1.9,
-    }
-    return bmr * factors.get(activity, 1.55)
+    return bmr
 
 
-# ─────────────────────────────────────────────
-# MILP OPTIMIZER  ← Math in AI #2 + #3
-# ─────────────────────────────────────────────
-def solve_meal_plan(df: pd.DataFrame,
-                    weekly_budget: float,
-                    target_calories_per_day: float,
-                    inventory_list: list[str]) -> tuple[list[int] | None, str]:
-    """
-    Math in AI — Mixed-Integer Linear Program (PuLP / CBC).
-    Auto-retries with progressively relaxed calorie floor (70% → 50% → no floor)
-    so a feasible plan is always returned when the budget allows 21 meals.
-    """
-    n = len(df)
-    target_weekly = target_calories_per_day * 7
-
-    # Build inventory bonus vector
-    inv_lower = [s.strip().lower() for s in inventory_list]
-    bonus = np.zeros(n)
-    for i, row in df.iterrows():
-        ing = [x.strip().lower() for x in row["Ingredients"].split(",")]
-        if any(item in ing for item in inv_lower):
-            bonus[i] = 100.0
-
-    # Try progressively relaxed calorie floors: 80% → 60% → 40% → no floor
-    calorie_floors = [0.80, 0.60, 0.40, 0.0]
-    solver = pulp.PULP_CBC_CMD(msg=0)
-
-    for floor_pct in calorie_floors:
-        prob = pulp.LpProblem("MealPlan", pulp.LpMaximize)
-        x = [pulp.LpVariable(f"x_{i}", lowBound=0, upBound=3, cat="Integer") for i in range(n)]
-
-        # Objective: maximise protein + inventory bonus
-        prob += pulp.lpSum((df.loc[i, "Protein"] + bonus[i]) * x[i] for i in range(n))
-
-        # Budget constraint
-        prob += pulp.lpSum(df.loc[i, "Cost"] * x[i] for i in range(n)) <= weekly_budget
-
-        # Calorie floor (relaxed each retry)
-        if floor_pct > 0:
-            prob += pulp.lpSum(df.loc[i, "Calories"] * x[i] for i in range(n)) >= floor_pct * target_weekly
-
-        # Exactly 21 meals
-        prob += pulp.lpSum(x[i] for i in range(n)) == 21
-
-        status = prob.solve(solver)
-
-        if pulp.LpStatus[prob.status] == "Optimal":
-            plan = []
-            for i in range(n):
-                val = int(round(pulp.value(x[i])))
-                plan.extend([i] * val)
-            floor_label = f"{int(floor_pct*100)}%" if floor_pct > 0 else "none"
-            return plan[:21], f"Optimal (calorie floor: {floor_label})"
-
-    # Last resort: check if budget is simply too low for 21 meals
-    min_cost_21 = sorted(df["Cost"].tolist())[:21]
-    if sum(min_cost_21) > weekly_budget:
-        return None, f"Budget too low — minimum needed: AED {sum(min_cost_21):.1f}"
-    return None, "Infeasible"
+def get_user_preferences():
+    preferences = st.multiselect("Choose your food preferences:", list(food_items_breakfast.keys()))
+    return preferences
 
 
-# ─────────────────────────────────────────────
-# SHANNON ENTROPY  ← Math in AI #4
-# ─────────────────────────────────────────────
-def shannon_entropy(plan_indices: list[int]) -> float:
-    """H = -Σ p_i · log2(p_i)  over unique meals in the plan."""
-    from collections import Counter
-    counts = Counter(plan_indices)
-    total  = len(plan_indices)
-    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+def get_user_allergies():
+    allergies = st.multiselect("Choose your food allergies:", list(food_items_breakfast.keys()))
+    return allergies
 
 
-# ─────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🧮 The Math Stack")
-    st.markdown("<span style='font-family:Space Mono;font-size:.7rem;color:#7a8099;'>STUDENT MEAL PLANNER AI</span>", unsafe_allow_html=True)
-    st.divider()
-    st.markdown("### 👤 Personal Parameters")
+def generate_items_list(target_calories, food_groups):
+    calories = 0
+    selected_items = []
+    total_items = set()
+    for foods in food_groups.values():
+        total_items.update(foods.keys())
 
-    age     = st.slider("Age", 14, 22, 18)
-    gender  = st.selectbox("Gender", ["Male", "Female"])
-    weight  = st.slider("Weight (kg)", 40, 110, 65)
-    height  = st.slider("Height (cm)", 140, 200, 168)
-    activity = st.selectbox("Activity Level", [
-        "Sedentary (little/no exercise)",
-        "Lightly active (1-3 days/week)",
-        "Moderately active (3-5 days/wk)",
-        "Very active (6-7 days/wk)",
-        "Athlete (2x/day training)",
-    ], index=1)
+    while abs(calories - target_calories) >= 10 and len(selected_items) < len(total_items):
+        group = random.choice(list(food_groups.keys()))
+        foods = food_groups[group]
+        item = random.choice(list(foods.keys()))
 
-    st.divider()
-    st.markdown("### 💰 Weekly Budget (AED)")
-    budget = st.slider("", 60, 600, 250, step=5)
+        if item not in selected_items:
+            cals = foods[item]
+            if calories + cals <= target_calories:
+                selected_items.append(item)
+                calories += cals
 
-    st.divider()
-    st.markdown("### 🥫 Inventory (items you already have)")
-    inventory_raw = st.text_area(
-        "One ingredient per line:",
-        placeholder="e.g.\neggs\nrice\nchicken breast\noats",
-        height=110,
-    )
-    inventory_list = [s.strip() for s in inventory_raw.strip().splitlines() if s.strip()]
-
-    st.divider()
-    st.markdown(
-        "<div class='solve-btn'>",
-        unsafe_allow_html=True,
-    )
-    solve_btn = st.button("⚡  Solve My Week", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    return selected_items, calories
 
 
-# ─────────────────────────────────────────────
-# LOAD DATA
-# ─────────────────────────────────────────────
-df = get_meal_data()
-daily_kcal = calc_target_calories(age, gender, weight, height, activity)
-weekly_kcal = daily_kcal * 7
+def knapsack(target_calories, food_groups):
+    items = []
+    for group, foods in food_groups.items():
+        for item, calories in foods.items():
+            items.append((calories, item))
+
+    n = len(items)
+    dp = [[0 for _ in range(target_calories + 1)] for _ in range(n + 1)]
+
+    for i in range(1, n + 1):
+        for j in range(target_calories + 1):
+            value, _ = items[i - 1]
+
+            if value > j:
+                dp[i][j] = dp[i - 1][j]
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i - 1][j - value] + value)
+
+    selected_items = []
+    j = target_calories
+    for i in range(n, 0, -1):
+        if dp[i][j] != dp[i - 1][j]:
+            _, item = items[i - 1]
+            selected_items.append(item)
+            j -= items[i - 1][0]
+
+    return selected_items, dp[n][target_calories]
 
 
-# ─────────────────────────────────────────────
-# HEADER
-# ─────────────────────────────────────────────
-st.markdown("""
-<h1>🧮 The Math Stack</h1>
-<p style='font-family:Space Mono;font-size:.8rem;color:#7a8099;letter-spacing:.12em;'>
-STUDENT MEAL PLANNER AI &nbsp;·&nbsp; MIXED-INTEGER LINEAR PROGRAMMING &nbsp;·&nbsp; AMBASSADOR SCHOOL MATHLETICS 2026
-</p>
-""", unsafe_allow_html=True)
-
-# Metric bar
-c1, c2, c3, c4, c5 = st.columns(5)
-for col, label, val, sub in [
-    (c1, "Daily Calories", f"{daily_kcal:,.0f}", "kcal target"),
-    (c2, "Weekly Budget",  f"AED {budget}",      "hard limit"),
-    (c3, "Total Meals",    "21",                  "3/day × 7 days"),
-    (c4, "Calorie Floor",  f"{daily_kcal*7*.8:,.0f}", "80% of weekly (auto-relax)"),
-    (c5, "Inventory",      str(len(inventory_list)), "items loaded"),
-]:
-    col.markdown(f"""
-    <div class='metric-card'>
-      <div class='metric-label'>{label}</div>
-      <div class='metric-value'>{val}</div>
-      <div class='metric-sub'>{sub}</div>
-    </div>""", unsafe_allow_html=True)
-
-st.markdown("<br>", unsafe_allow_html=True)
+bmr = calculate_bmr(weight, height, age, gender)
+round_bmr = round(bmr, 2)
+st.subheader(f"Your daily intake needs to have: {round_bmr} calories")
+choose_algo = "Knapsack"
+if 'clicked' not in st.session_state:
+    st.session_state.clicked = False
 
 
-# ─────────────────────────────────────────────
-# MATH-IN-AI TAGS
-# ─────────────────────────────────────────────
-st.markdown("""
-<div class='info-box'>
-  <strong>Math in AI — Where it lives in this app:</strong><br><br>
-  <span class='math-tag'>MILP · PuLP</span> Objective function maximises weekly protein subject to budget + calorie constraints &nbsp;|&nbsp;
-  <span class='math-tag'>Harris-Benedict</span> Biometric equation calculates personalised calorie targets &nbsp;|&nbsp;
-  <span class='math-tag'>Inventory Weighting</span> +100 MILP objective bonus for meals using your pantry items &nbsp;|&nbsp;
-  <span class='math-tag'>Shannon Entropy H</span> Measures plan diversity to prevent metabolic adaptation &nbsp;|&nbsp;
-  <span class='math-tag'>Operations Research</span> Full OR pipeline: model → solve → interpret
-</div>
-""", unsafe_allow_html=True)
+def click_button():
+    st.session_state.clicked = True
 
 
-# ─────────────────────────────────────────────
-# TABS
-# ─────────────────────────────────────────────
-tab1, tab2 = st.tabs(["📅  Weekly Meal Plan", "🔬  The Science"])
+if "openai_model" not in st.session_state:
+    st.session_state["openai_model"] = "llama-3.3-70b-versatile"
+    # st.session_state["openai_model"] = "gpt-4o"
 
-# ── TAB 1 — WEEKLY MEAL PLAN ─────────────────
-with tab1:
-    if "plan" not in st.session_state:
-        st.session_state.plan = None
-        st.session_state.status = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-    if solve_btn:
-        with st.spinner("Running MILP solver (PuLP / CBC)…"):
-            plan, status = solve_meal_plan(df, budget, daily_kcal, inventory_list)
-        st.session_state.plan   = plan
-        st.session_state.status = status
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-    plan   = st.session_state.plan
-    status = st.session_state.status
+st.button("Create a Basket", on_click=click_button)
+if st.session_state.clicked:
+    calories_breakfast = round((bmr * 0.5), 2)
+    calories_lunch = round((bmr * (1 / 3)), 2)
+    calories_dinner = round((bmr * (1 / 6)), 2)
 
-    if plan is None and not solve_btn:
-        st.markdown("""
-        <div style='text-align:center;padding:3rem 0;'>
-          <div style='font-size:3rem;'>🧮</div>
-          <div style='font-family:DM Serif Display,serif;font-size:1.6rem;color:#f5c518;margin:.5rem 0;'>
-            Set your parameters and hit Solve
-          </div>
-          <div style='color:#7a8099;font-size:.9rem;'>
-            The MILP engine will generate your optimal 21-meal weekly plan.
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-    elif status and status != "Optimal":
-        min21 = sum(sorted(df["Cost"].tolist())[:21])
-        st.error(
-            f"⚠️ **Could not build a plan.** Status: `{status}`\n\n"
-            f"The cheapest possible 21-meal week costs **AED {min21:.1f}**. "
-            f"Your budget is **AED {budget}**. "
-            f"{'Increase your budget above AED ' + str(round(min21+1)) + ' to continue.' if budget < min21 else 'Try adjusting your activity level or calorie target.'}"
-        )
+    if choose_algo == "Random Greedy":
+        meal_items_morning, cal_m = generate_items_list(calories_breakfast, food_items_breakfast)
+        meal_items_lunch, cal_l = generate_items_list(calories_lunch, food_items_lunch)
+        meal_items_dinner, cal_d = generate_items_list(calories_dinner, food_items_dinner)
+
     else:
-        if plan:
-            # ── Summary stats
-            total_cost    = sum(df.loc[i, "Cost"]     for i in plan)
-            total_protein = sum(df.loc[i, "Protein"]  for i in plan)
-            total_kcal    = sum(df.loc[i, "Calories"] for i in plan)
-            entropy_val   = shannon_entropy(plan)
+        meal_items_morning, cal_m = knapsack(int(calories_breakfast), food_items_breakfast)
+        meal_items_lunch, cal_l = knapsack(int(calories_lunch), food_items_lunch)
+        meal_items_dinner, cal_d = knapsack(int(calories_dinner), food_items_dinner)
+    st.header("Your Personalized Meal Plan")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.write("Calories for Morning: " + str(calories_breakfast))
+        st.dataframe(pd.DataFrame({"Morning": meal_items_morning}))
+        st.write("Total Calories: " + str(cal_m))
 
-            s1, s2, s3, s4 = st.columns(4)
-            for col, label, val, good in [
-                (s1, "Total Cost",    f"AED {total_cost:.1f}",    total_cost <= budget),
-                (s2, "Total Protein", f"{total_protein} g",       True),
-                (s3, "Total Calories",f"{total_kcal:,} kcal",     total_kcal >= 0.7*weekly_kcal),
-                (s4, "Plan Entropy",  f"H = {entropy_val:.2f}",   entropy_val > 3.0),
-            ]:
-                colour = "#3af0b0" if good else "#ff5e5b"
-                col.markdown(f"""
-                <div class='metric-card' style='border-color:{colour}33;'>
-                  <div class='metric-label'>{label}</div>
-                  <div class='metric-value' style='font-size:1.5rem;color:{colour};'>{val}</div>
-                </div>""", unsafe_allow_html=True)
+    with col2:
+        st.write("Calories for Lunch: " + str(calories_lunch))
+        st.dataframe(pd.DataFrame({"Lunch": meal_items_lunch}))
+        st.write("Total Calories: " + str(cal_l))
 
-            st.markdown("<br>", unsafe_allow_html=True)
+    with col3:
+        st.write("Calories for Dinner: " + str(calories_dinner))
+        st.dataframe(pd.DataFrame({"Dinner": meal_items_dinner}))
+        st.write("Total Calories: " + str(cal_d))
 
-            # ── 7 days × 3 meals
-            days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            for d, day in enumerate(days):
-                st.markdown(f"### {day}")
-                cols3 = st.columns(3)
-                meal_names = ["🌅 Breakfast", "☀️ Lunch", "🌙 Dinner"]
+    if st.button("Generate Meal Plan"):
+        st.markdown("""---""")
+        st.subheader("Breakfast")
+        user_content = pre_prompt_b + str(meal_items_morning) + example_response + pre_breakfast + negative_prompt
+        temp_messages = [{"role": "user", "content": user_content}]
+        with st.chat_message("assistant"):
+            full_response = ""
+            response = requests.post(
+                GROQ_API_URL,
+                headers=HEADERS,
+                json={
+                    "model": st.session_state["openai_model"],
+                    "messages": temp_messages
+                },
+                verify=False
+            )
+            response_json = response.json()
+            if "choices" in response_json:
+                full_response = response_json["choices"][0]["message"]["content"]
+                st.write(full_response)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": full_response})
 
-                for m in range(3):
-                    idx   = plan[d * 3 + m]
-                    row   = df.loc[idx]
-                    # inventory highlight
-                    inv_match = any(
-                        item.lower() in row["Ingredients"].lower()
-                        for item in inventory_list
-                    )
-                    border = "#f5c518" if inv_match else "#252a38"
-                    badge  = "🏷️ <b style='color:#f5c518;font-size:.7rem;'>USES YOUR PANTRY</b><br>" if inv_match else ""
+        st.markdown("""---""")
+        st.subheader("Lunch")
+        user_content = pre_prompt_l + str(meal_items_lunch) + example_response + pre_lunch + negative_prompt
+        temp_messages = [{"role": "user", "content": user_content}]
+        with st.chat_message("assistant"):
+            full_response = ""
+            response = requests.post(
+                GROQ_API_URL,
+                headers=HEADERS,
+                json={
+                    "model": st.session_state["openai_model"],
+                    "messages": temp_messages
+                },
+                verify=False
+            )
+            response_json = response.json()
+            if "choices" in response_json:
+                full_response = response_json["choices"][0]["message"]["content"]
+                st.write(full_response)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": full_response})
 
-                    with cols3[m]:
-                        st.markdown(f"""
-                        <div class='meal-card' style='border-color:{border};'>
-                          <img class='meal-img' src='{row["Image"]}' alt='{row["Name"]}'
-                               onerror="this.src='https://images.unsplash.com/photo-1512058564366-18510be2db19?w=400&q=70'"/>
-                          <div class='meal-body'>
-                            <div style='font-family:Space Mono;font-size:.65rem;color:#7a8099;'>{meal_names[m]}</div>
-                            <div class='meal-name'>{row["Name"]}</div>
-                            {badge}
-                            <div class='meal-macro'>
-                              <span class='pill pill-gold'>{row["Calories"]} kcal</span>
-                              <span class='pill pill-green'>{row["Protein"]}g protein</span>
-                              <span class='pill pill-red'>AED {row["Cost"]:.1f}</span>
-                            </div>
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        with st.expander("📖 View Recipe"):
-                            st.markdown(f"**Ingredients:** {row['Ingredients']}")
-                            st.markdown("---")
-                            st.markdown(row["Recipe"])
-
-                st.divider()
-
-# ── TAB 2 — THE SCIENCE ──────────────────────
-with tab2:
-    st.markdown("## The Science Behind The Math Stack")
-    st.markdown(
-        "Built for **Ambassador School Mathletics 2026** — theme: **Math in AI**. "
-        "Here is a plain-English explanation of every mathematical idea powering this app."
-    )
-    st.divider()
-
-    st.markdown("### 🧠 ① What is MILP? (The Brain of the App)")
-    st.markdown("""
-<div class='info-box'>
-<span class='math-tag'>Math in AI — Core Engine</span><br><br>
-<b>The problem:</b> You have 200 meals to choose from. You need exactly 21 meals in a week
-(3 per day). You want as much protein as possible, but you can't go over your budget,
-and you need enough calories. How do you find the best combination out of billions of options?<br><br>
-<b>The answer:</b> <b>Mixed-Integer Linear Programming (MILP)</b> — a type of AI that uses
-algebra to search through all possibilities and guarantee the single best answer.<br><br>
-<b>In simple terms, the AI asks:</b><br>
-✅ &nbsp; "Pick meals that give me the MOST protein"<br>
-🚫 &nbsp; "But don't go over my AED budget"<br>
-🚫 &nbsp; "But make sure total calories are enough"<br>
-🚫 &nbsp; "And pick exactly 21 meals total"<br><br>
-<b>The math (written simply):</b><br>
-Each meal gets a number x (0, 1, 2, or 3 = how many times it appears).<br>
-The AI finds the best x values so protein is maximum and all rules are satisfied.<br><br>
-<code>Maximise: Σ protein[i] × x[i]</code><br>
-<code>Rule 1:   Σ cost[i] × x[i]  ≤ your budget</code><br>
-<code>Rule 2:   Σ calories[i] × x[i] ≥ minimum calories</code><br>
-<code>Rule 3:   Σ x[i] = 21 meals exactly</code>
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown("### 🥫 ② Inventory Weighting (Pantry Bonus)")
-    st.markdown("""
-<div class='info-box'>
-<span class='math-tag'>Math in AI — Smart Preference Scoring</span><br><br>
-<b>The problem:</b> If you already have eggs and rice at home, why would the AI ignore them?<br><br>
-<b>The fix:</b> Any meal containing an ingredient from your pantry list gets a <b>+100 bonus
-added to its protein score</b> in the AI's objective.<br><br>
-Since most meals only have 10–45g of protein, a +100 bonus is <i>enormous</i> — it basically
-tells the AI: "I really, really prefer this meal." The AI will always pick it if the budget allows.<br><br>
-<b>Example:</b> "Scrambled Eggs" has 21g protein. If you have eggs at home, the AI treats it
-as if it had 121g protein. It wins every time.<br><br>
-This saves money by using what you already own — no wasted ingredients.
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown("### 🔥 ③ How Are Your Calories Calculated?")
-    st.markdown("""
-<div class='info-box'>
-<span class='math-tag'>Math in AI — Harris-Benedict Equation</span><br><br>
-Your personal calorie target is not a guess. It is calculated using a famous medical formula
-called the <b>Harris-Benedict Equation</b>. It uses your age, weight, height, and
-how active you are.<br><br>
-<b>Step 1 — Base calories (if you did nothing all day):</b><br>
-For boys: &nbsp; BMR = 88.4 + (13.4 × weight) + (4.8 × height) − (5.7 × age)<br>
-For girls: BMR = 447.6 + (9.2 × weight) + (3.1 × height) − (4.3 × age)<br><br>
-<b>Step 2 — Adjust for activity:</b><br>
-Multiply BMR by your activity level (1.2 for rest days → 1.9 for athlete training).<br><br>
-<b>Result:</b> Your unique daily calorie need. The AI uses this as its calorie target for the week.
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown("### 📊 ④ Shannon Entropy (Is Your Plan Boring?)")
-    st.markdown("""
-<div class='info-box'>
-<span class='math-tag'>Math in AI — Information Theory</span><br><br>
-<b>The problem:</b> If the AI picks the same 3 meals every single day, you will get bored
-AND your body will adapt (burn fewer calories because it "knows" what's coming).<br><br>
-<b>Shannon Entropy</b> is a score borrowed from information theory that measures
-<i>how varied</i> your meal plan is. A higher score = more variety = better nutrition.<br><br>
-<b>Formula:</b> H = −Σ (fraction of times meal appears) × log₂(fraction)<br><br>
-<b>Simple example:</b> If every meal is different → H is high (lots of surprise, lots of variety).
-If you eat the same meal 21 times → H = 0 (no variety at all).<br><br>
-A good plan scores <b>H &gt; 3.0</b>. The app shows your H score after solving.
-The AI is limited to picking any meal at most 3 times, which keeps entropy high automatically.
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown("### 🚀 ⑤ Operations Research — The Same Math Airlines Use")
-    st.markdown("""
-<div class='info-box'>
-<span class='math-tag'>Math in AI — Operations Research</span><br><br>
-<b>Operations Research (OR)</b> is the science of making the best decision when you have
-limited resources. Airlines use it to schedule pilots. Amazon uses it to route packages.
-Hospitals use it to allocate beds.<br><br>
-<b>This app uses OR in 5 steps:</b><br><br>
-<b>1. Define the goal</b> — Maximise protein for a student on a budget.<br>
-<b>2. Write the rules as math</b> — Budget, calorie limits, and meal count become equations.<br>
-<b>3. Run the solver</b> — The CBC algorithm tests millions of combinations in under a second.<br>
-<b>4. Read the answer</b> — The 21 best meals are returned as your weekly plan.<br>
-<b>5. Adjust and re-run</b> — Change your budget slider? The math re-runs instantly.<br><br>
-The only difference between this app and a Fortune 500 OR system is the scale.
-The mathematics is identical.
-</div>
-""", unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("""
-    <div style='text-align:center;font-family:Space Mono;font-size:.7rem;color:#7a8099;padding:1.5rem 0;'>
-    THE MATH STACK &nbsp;·&nbsp; AMBASSADOR SCHOOL MATHLETICS 2026 &nbsp;·&nbsp; MATH IN AI<br>
-    Built with PuLP · Streamlit · Pandas · NumPy · SciPy
-    </div>
-    """, unsafe_allow_html=True)
+        st.markdown("""---""")
+        st.subheader("Dinner")
+        user_content = pre_prompt_d + str(meal_items_dinner) + example_response + pre_dinner + negative_prompt
+        temp_messages = [{"role": "user", "content": user_content}]
+        with st.chat_message("assistant"):
+            full_response = ""
+            response = requests.post(
+                GROQ_API_URL,
+                headers=HEADERS,
+                json={
+                    "model": st.session_state["openai_model"],
+                    "messages": temp_messages
+                },
+                verify=False
+            )
+            response_json = response.json()
+            if "choices" in response_json:
+                full_response = response_json["choices"][0]["message"]["content"]
+                st.write(full_response)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": full_response})
+        st.write("Thank you for using our AI app! I hope you enjoyed it!")
+hide_streamlit_style = """
+                    <style>
+                    # MainMenu {visibility: hidden;}
+                    footer {visibility: hidden;}
+                    footer:after {
+                    content:'Built by Shravan and Team'; 
+                    visibility: visible;
+    	            display: block;
+    	            position: relative;
+    	            # background-color: red;
+    	            padding: 15px;
+    	            top: 2px;
+    	            }
+    	            #ai-meal-planner {
+    	              text-align: center; !important
+        	            }
+                    </style>
+                    """
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
